@@ -8,6 +8,7 @@ non-zero on any failure.
 import json
 import os
 import sys
+from decimal import Decimal, localcontext
 
 import httpx
 
@@ -118,6 +119,63 @@ def main() -> int:
             ba, bb = ra.json(), rb.json()
             check("equivalent writings identical verdict", ba == bb, json.dumps([ba, bb]))
             check("equivalent writings approved at the limit", ba["approved"] is True)
+
+        # 6. A velocity exceeding the cap only at the 60th decimal place must
+        #    still be rejected, with peak/violation shown distinctly from the
+        #    smaller limit (regression: used to collapse onto 1.0).
+        b = "1.000000000000000000000000000000000000000000000000000000000001"
+        with localcontext() as ctx:
+            ctx.prec = 100
+            bd = Decimal(b)
+            b2, b3 = str(2 * bd), str(3 * bd)
+        tiny_over = {
+            "joints": [
+                {"lower": "0", "upper": b3, "maxVelocity": "1", "maxAcceleration": "1"}
+            ],
+            "segments": [{"duration": "3", "controlPoints": [["0", b, b2, b3]]}],
+        }
+        r = post(client, tiny_over)
+        ok = r.status_code == 200
+        check("60th-decimal exceedance -> 200", ok, r.text)
+        if ok:
+            body = r.json()
+            violation = {
+                "segment": 1,
+                "joint": 1,
+                "constraint": "velocity",
+                "value": b,
+                "limit": 1.0,
+            }
+            check("60th-decimal exceedance rejected", body["approved"] is False)
+            check("60th-decimal violation located", body["violations"] == [violation])
+            check(
+                "60th-decimal peak distinct from limit",
+                body["peaks"][0]["maxVelocity"] == b,
+                json.dumps(body["peaks"]),
+            )
+
+        # 7. Adjacent segments whose boundary velocities differ only at the
+        #    60th decimal must be 422, located at the next segment's first
+        #    control point (regression: used to pass as continuous).
+        discontinuous = {
+            "joints": [
+                {"lower": "-2", "upper": "2", "maxVelocity": "10", "maxAcceleration": "10"}
+            ],
+            "segments": [
+                {"duration": "1", "controlPoints": [["-1", "-1", "-1", "0"]]},
+                {"duration": "1", "controlPoints": [["0", b, b, b]]},
+            ],
+        }
+        r = post(client, discontinuous)
+        check("60th-decimal velocity discontinuity -> 422", r.status_code == 422, r.text)
+        if r.status_code == 422:
+            locs = [tuple(e["loc"]) for e in r.json()["detail"] if e["type"] == "continuity.velocity"]
+            check(
+                "velocity discontinuity located at segments[1].controlPoints[0]",
+                ("segments", 1, "controlPoints", 0) in locs
+                or ("body", "segments", 1, "controlPoints", 0) in locs,
+                str(locs),
+            )
 
     print()
     if failures:

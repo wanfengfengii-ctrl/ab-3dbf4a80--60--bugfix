@@ -1,5 +1,7 @@
 """End-to-end tests for POST /api/trajectories/audit."""
 
+from decimal import Decimal, localcontext
+
 from fastapi.testclient import TestClient
 
 
@@ -22,6 +24,10 @@ def seg(duration, points):
 # A smoothstep segment [0,0,1,1] with T=1: endpoint velocities are zero while
 # the *interior* speed peaks at 1.5 (at tau=0.5). Endpoint acceleration is 6.
 SMOOTHSTEP = seg(1, [[0, 0, 1, 1]])
+
+# 1 + 1e-60 as a canonical decimal string.  A constant-speed segment built from
+# it exceeds a limit of "1" strictly, by one unit at the 60th decimal place.
+B = "1.000000000000000000000000000000000000000000000000000000000001"
 
 
 def test_health(client: TestClient):
@@ -258,3 +264,104 @@ def test_equivalent_decimal_writings_give_identical_verdict(client: TestClient):
     assert responses[0]["approved"] is True
     assert responses[0]["peaks"][0]["maxVelocity"] == 1.5
     assert responses[0]["peaks"][0]["maxAcceleration"] == 6.0
+
+
+def _b_multiples():
+    with localcontext() as ctx:
+        ctx.prec = 100
+        b = Decimal(B)
+        return B, str(2 * b), str(3 * b)
+
+
+def test_sixtieth_decimal_velocity_exceedance_is_caught(client: TestClient):
+    """A velocity of 1 + 1e-60 strictly exceeds a "1" limit (regression).
+
+    Every input is a high-precision decimal string; the excess must survive
+    adjudication and reporting instead of collapsing onto the limit.
+    """
+    _, b2, b3 = _b_multiples()
+    payload = {
+        "joints": [
+            {"lower": "0", "upper": b3, "maxVelocity": "1", "maxAcceleration": "1"}
+        ],
+        # Constant speed 3*(B-0)/3 = B > 1; acceleration is exactly zero.
+        "segments": [seg("3", [["0", B, b2, b3]])],
+    }
+    r = client.post(PATH, json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["approved"] is False
+    assert body["violations"] == [
+        {"segment": 1, "joint": 1, "constraint": "velocity", "value": B, "limit": 1.0}
+    ]
+    assert body["peaks"] == [
+        {"joint": 1, "maxVelocity": B, "maxAcceleration": 0.0}
+    ]
+
+
+def test_sixtieth_decimal_velocity_discontinuity_is_422(client: TestClient):
+    """Boundary velocities equal in position but differing at decimal 60 (regression)."""
+    payload = {
+        "joints": [{"lower": "-2", "upper": "2", "maxVelocity": "10", "maxAcceleration": "10"}],
+        "segments": [
+            seg("1", [["-1", "-1", "-1", "0"]]),
+            # Start position matches (0), but start velocity 3B != 3.
+            seg("1", [["0", B, B, B]]),
+        ],
+    }
+    r = client.post(PATH, json=payload)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    match = [
+        e for e in detail
+        if e["type"] == "continuity.velocity"
+        and tuple(e["loc"]) == ("body", "segments", 1, "controlPoints", 0)
+    ]
+    assert match
+    assert not [e for e in detail if e["type"] == "continuity.position"]
+
+
+def test_boundary_velocity_equal_at_60th_decimal_is_continuous(client: TestClient):
+    """Exact equality -- even with 60th-decimal values -- stays continuous."""
+    _, b2, b3 = _b_multiples()
+    with localcontext() as ctx:
+        ctx.prec = 100
+        b4 = str(4 * Decimal(B))
+    # Segment 1 ends at position B with speed 3B (control points 0,0,0,B);
+    # segment 2 starts at B with control points B,2B,3B,4B, hence the same
+    # start speed 3(2B-B) = 3B.
+    payload = {
+        "joints": [{"lower": "0", "upper": b4, "maxVelocity": "100", "maxAcceleration": "100"}],
+        "segments": [
+            seg("1", [["0", "0", "0", B]]),
+            seg("1", [[B, b2, b3, b4]]),
+        ],
+    }
+    r = client.post(PATH, json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json()["approved"] is True
+
+
+def test_exact_equality_with_nonterminating_ratio_still_passes(client: TestClient):
+    """3/2 compared against 1.5 must remain equal despite decimal rounding.
+
+    The adjudication compares exact ratios, so no rounding ghost (and no
+    tolerance) decides the verdict: algebraic equality passes, while an
+    adjacent 60-digit value fails.
+    """
+    at_limit = {
+        "joints": [joint(upper=1, v="1.5", a=10)],
+        "segments": [SMOOTHSTEP],
+    }
+    assert client.post(PATH, json=at_limit).json()["approved"] is True
+
+    just_below = "1.499999999999999999999999999999999999999999999999999999999999"
+    exceeding = {
+        "joints": [joint(upper=1, v=just_below, a=10)],
+        "segments": [SMOOTHSTEP],
+    }
+    body = client.post(PATH, json=exceeding).json()
+    assert body["approved"] is False
+    assert body["violations"][0]["constraint"] == "velocity"
+    assert Decimal(str(body["violations"][0]["value"])) == Decimal("1.5")
+

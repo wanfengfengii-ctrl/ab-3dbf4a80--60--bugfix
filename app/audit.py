@@ -1,26 +1,18 @@
 """Semantic validation and continuous-curve auditing."""
 
-from decimal import Decimal, getcontext
+from decimal import Decimal
 
 from fastapi.exceptions import RequestValidationError
 
 from .bezier import (
+    Rational,
     decimal_endpoint_positions,
     decimal_endpoint_velocities_equal,
     decimal_endpoint_velocity,
     decimal_segment_peaks,
 )
+from .decimalio import decimal_to_json
 from .schemas import AuditRequest
-
-# All segment math (including the interior velocity extremum, the only step
-# that can be non-terminating) is carried out at high Decimal precision,
-# rather than on control-period samples.
-getcontext().prec = 60
-
-# Only a rounding ghost this small is forgiven so that a value mathematically
-# equal to a limit is never reported as a violation.  Genuine exceedances are
-# vastly larger.
-_COMPARE_EPS = Decimal("1e-40")
 
 _CONSTRAINT_VELOCITY = "velocity"
 _CONSTRAINT_ACCELERATION = "acceleration"
@@ -28,13 +20,6 @@ _CONSTRAINT_ACCELERATION = "acceleration"
 
 def _err(loc: list, msg: str, err_type: str = "value_error") -> dict:
     return {"loc": loc, "msg": msg, "type": err_type}
-
-
-def _exceeds(value: Decimal, limit: Decimal) -> bool:
-    """True when value is strictly over the limit (equality passes)."""
-    if value <= limit:
-        return False
-    return (value - limit) > _COMPARE_EPS * max(abs(limit), Decimal(1))
 
 
 def audit_trajectory(req: AuditRequest) -> dict:
@@ -156,48 +141,64 @@ def audit_trajectory(req: AuditRequest) -> dict:
         raise RequestValidationError(errors)
 
     # --- Continuous adjudication over every segment and joint -------------
+    # Comparisons are exact: Rational.exceeds cross-multiplies decimal
+    # integers, so any velocity/acceleration strictly over the limit is
+    # caught regardless of how tiny the excess is, and algebraic equality
+    # with the limit still passes.
     violations: list[dict] = []
     peaks_out: list[dict] = []
 
     for j, joint in enumerate(req.joints):
-        joint_speed = Decimal(0)
-        joint_accel = Decimal(0)
+        joint_speed: Rational | None = None
+        joint_accel: Rational | None = None
         for s in range(len(req.segments)):
             peaks = decimal_segment_peaks(durations[s], points[s][j])
             speed = peaks.max_speed
             accel = peaks.max_accel
 
-            if speed > joint_speed:
+            if joint_speed is None or speed.cross_gt(
+                joint_speed.numerator, joint_speed.denominator
+            ):
                 joint_speed = speed
-            if accel > joint_accel:
+            if joint_accel is None or accel.cross_gt(
+                joint_accel.numerator, joint_accel.denominator
+            ):
                 joint_accel = accel
 
-            if _exceeds(speed, joint.maxVelocity):
+            if speed.exceeds(joint.maxVelocity):
                 violations.append(
                     {
                         "segment": s + 1,
                         "joint": j + 1,
                         "constraint": _CONSTRAINT_VELOCITY,
-                        "value": float(speed),
-                        "limit": float(joint.maxVelocity),
+                        "value": decimal_to_json(
+                            speed.to_decimal()
+                        ),
+                        "limit": decimal_to_json(joint.maxVelocity),
                     }
                 )
-            if _exceeds(accel, joint.maxAcceleration):
+            if accel.exceeds(joint.maxAcceleration):
                 violations.append(
                     {
                         "segment": s + 1,
                         "joint": j + 1,
                         "constraint": _CONSTRAINT_ACCELERATION,
-                        "value": float(accel),
-                        "limit": float(joint.maxAcceleration),
+                        "value": decimal_to_json(
+                            accel.to_decimal()
+                        ),
+                        "limit": decimal_to_json(joint.maxAcceleration),
                     }
                 )
 
         peaks_out.append(
             {
                 "joint": j + 1,
-                "maxVelocity": float(joint_speed),
-                "maxAcceleration": float(joint_accel),
+                "maxVelocity": decimal_to_json(
+                    joint_speed.to_decimal()
+                ),
+                "maxAcceleration": decimal_to_json(
+                    joint_accel.to_decimal()
+                ),
             }
         )
 

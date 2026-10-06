@@ -49,4 +49,24 @@ def _check(d: Decimal) -> Decimal:
     return d
 
 
+def decimal_to_json(d: Decimal) -> Any:
+    """Render a computed Decimal without hiding any significant excess.
+
+    When the value survives a float round trip it is emitted as a JSON number
+    (keeping outputs such as ``1.5`` / ``6.0``).  Otherwise its full canonical
+    decimal text is emitted as a string, so a value is never displayed as
+    identical to a smaller number merely because both round to the same float
+    (e.g. a velocity of 1 + 1e-60 versus a limit of 1).
+
+    The float round-trip is checked via the float's shortest round-trip
+    repr (``str(f)``) rather than its raw binary value, and without
+    :meth:`Decimal.normalize`, which itself rounds at the current context
+    precision and could erase the very excess we are trying to surface.
+    """
+    f = float(d)
+    if abs(f) != float("inf") and Decimal(str(f)) == d:
+        return f
+    return d.to_eng_string()
+
+
 StrictDecimal = Annotated[Decimal, BeforeValidator(to_decimal)]
