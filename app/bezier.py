@@ -17,57 +17,60 @@ Because the segment degree is exactly three:
   when it lies strictly inside (0, 1).
 
 This adjudges the *whole* continuous curve instead of control-period samples.
-All arithmetic is exact rational :class:`~decimal.Decimal` apart from the
-interior-extremum evaluation, which runs at the caller's high context
-precision.
+Every input is a finite decimal, hence an exact rational; all adjudication
+(peak evaluation, limit comparisons, boundary continuity cross products) is
+performed with :class:`~fractions.Fraction`, so no working precision can ever
+round a genuine -- however tiny -- exceedance or discontinuity away.  Only the
+final human-facing rendering needs decimal rounding.
 """
 
 from dataclasses import dataclass
-from decimal import Decimal
+from fractions import Fraction
 
 
 @dataclass(frozen=True)
 class PeakResult:
-    max_speed: Decimal
-    max_accel: Decimal
+    max_speed: Fraction
+    max_accel: Fraction
 
 
 def decimal_endpoint_positions(
-    points: tuple[Decimal, Decimal, Decimal, Decimal],
-) -> tuple[Decimal, Decimal]:
+    points: tuple,
+) -> tuple:
     return points[0], points[3]
 
 
 def decimal_endpoint_velocities_equal(
-    duration_a: Decimal,
-    points_a: tuple[Decimal, Decimal, Decimal, Decimal],
-    duration_b: Decimal,
-    points_b: tuple[Decimal, Decimal, Decimal, Decimal],
+    duration_a,
+    points_a: tuple,
+    duration_b,
+    points_b: tuple,
 ) -> bool:
     """Exact equality of the end velocity of segment A and start of segment B.
 
-    Compares cross products so no (rounded) division is involved:
+    Compares cross products so no division is involved at all:
     3(P3-P2)/T_a == 3(Q1-Q0)/T_b  <=>  (P3-P2)*T_b == (Q1-Q0)*T_a.
+    Both sides are evaluated as exact rationals, independent of any Decimal
+    context precision.
     """
     _, _, pa2, pa3 = points_a
     pb0, pb1, _, _ = points_b
-    return (pa3 - pa2) * duration_b == (pb1 - pb0) * duration_a
+    return (Fraction(pa3) - Fraction(pa2)) * Fraction(duration_b) == (
+        Fraction(pb1) - Fraction(pb0)
+    ) * Fraction(duration_a)
 
 
-def decimal_endpoint_velocity(
-    duration: Decimal, points: tuple[Decimal, ...], end: bool
-) -> Decimal:
-    """Endpoint velocity 3(P1-P0)/T (or 3(P3-P2)/T) for diagnostic messages."""
+def decimal_endpoint_velocity(duration, points: tuple, end: bool) -> Fraction:
+    """Endpoint velocity 3(P1-P0)/T (or 3(P3-P2)/T), exactly."""
     if end:
-        return Decimal(3) * (points[3] - points[2]) / duration
-    return Decimal(3) * (points[1] - points[0]) / duration
+        return Fraction(3) * (Fraction(points[3]) - Fraction(points[2])) / Fraction(duration)
+    return Fraction(3) * (Fraction(points[1]) - Fraction(points[0])) / Fraction(duration)
 
 
-def decimal_segment_peaks(
-    duration: Decimal, points: tuple[Decimal, Decimal, Decimal, Decimal]
-) -> PeakResult:
-    """Maximum speed and acceleration magnitude over tau in [0, 1]."""
-    p0, p1, p2, p3 = points
+def decimal_segment_peaks(duration, points: tuple) -> PeakResult:
+    """Maximum speed and acceleration magnitude over tau in [0, 1], exact."""
+    p0, p1, p2, p3 = (Fraction(p) for p in points)
+    total_time = Fraction(duration)
 
     d10 = p1 - p0
     d21 = p2 - p1
@@ -76,25 +79,25 @@ def decimal_segment_peaks(
     # Velocity (scaled by 3/T) is the quadratic q(tau) = a*tau^2 + b*tau + c,
     # obtained by expanding the Bernstein form of p'(tau)/3.
     c = d10
-    b = Decimal(2) * (d21 - d10)
-    a = d10 - Decimal(2) * d21 + d32
+    b = 2 * (d21 - d10)
+    a = d10 - 2 * d21 + d32
 
-    velocity_scale = Decimal(3) / duration
     speed_candidates = [abs(c), abs(a + b + c)]  # tau = 0 and tau = 1
 
     if a != 0:
-        tau_star = -b / (Decimal(2) * a)
-        if Decimal(0) < tau_star < Decimal(1):
-            q_star = a * tau_star * tau_star + b * tau_star + c
+        # Vertex tau* = -b/(2a); q(tau*) = c - b^2/(4a).  Both are rational,
+        # so the interior extremum participates in adjudication exactly.
+        tau_star = -b / (2 * a)
+        if 0 < tau_star < 1:
+            q_star = c - (b * b) / (4 * a)
             speed_candidates.append(abs(q_star))
     # a == 0: q is linear, extrema are the endpoints already covered.
 
-    max_speed = velocity_scale * max(speed_candidates)
+    max_speed = 3 * max(speed_candidates) / total_time
 
     # Acceleration is affine in tau; its magnitude peak lies at an endpoint.
-    accel_scale = Decimal(6) / (duration * duration)
-    a0 = p0 - Decimal(2) * p1 + p2
-    a1 = p1 - Decimal(2) * p2 + p3
-    max_accel = accel_scale * max(abs(a0), abs(a1))
+    a0 = p0 - 2 * p1 + p2
+    a1 = p1 - 2 * p2 + p3
+    max_accel = 6 * max(abs(a0), abs(a1)) / (total_time * total_time)
 
     return PeakResult(max_speed=max_speed, max_accel=max_accel)

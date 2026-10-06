@@ -1,18 +1,23 @@
 """API smoke tests against a running server.
 
-Exercises both an approved and a violating trajectory over the real HTTP
-interface, plus 422 handling and decimal-equivalence invariance.  Exits
+Exercises an approved and a violating trajectory over the real HTTP
+interface, 422 handling, decimal-equivalence invariance, exact limit
+equality, and 60th-decimal-place exceedance / discontinuity cases.  Exits
 non-zero on any failure.
 """
 
 import json
 import os
 import sys
+from decimal import Decimal
 
 import httpx
 
 BASE_URL = os.getenv("API_BASE_URL", "http://api:8000").rstrip("/")
 PATH = "/api/trajectories/audit"
+
+# 1 + 1e-60: indistinguishable from 1 in a double float.
+B = "1.000000000000000000000000000000000000000000000000000000000001"
 
 failures: list[str] = []
 
@@ -118,6 +123,109 @@ def main() -> int:
             ba, bb = ra.json(), rb.json()
             check("equivalent writings identical verdict", ba == bb, json.dumps([ba, bb]))
             check("equivalent writings approved at the limit", ba["approved"] is True)
+
+        # 6. Exact equality with the cap is approved: constant speed 1, cap 1.
+        at_limit = {
+            "joints": [
+                {"lower": 0, "upper": 10, "maxVelocity": "1", "maxAcceleration": "10"}
+            ],
+            "segments": [{"duration": "3", "controlPoints": [["0", "1", "2", "3"]]}],
+        }
+        r = post(client, at_limit)
+        ok = r.status_code == 200
+        check("speed exactly at limit -> 200", ok, r.text)
+        if ok:
+            check("speed exactly at limit approved", r.json()["approved"] is True)
+
+        # 7. Constant speed 1+1e-60 against cap 1: a strict exceedance that a
+        #    double (or 60-digit Decimal) pipeline rounds away.
+        micro = {
+            "joints": [
+                {"lower": 0, "upper": 10, "maxVelocity": "1", "maxAcceleration": "1"}
+            ],
+            "segments": [
+                {
+                    "duration": "3",
+                    "controlPoints": [["0", B, "2" + B[1:-1] + "2", "3" + B[1:-1] + "3"]],
+                }
+            ],
+        }
+        r = post(client, micro)
+        ok = r.status_code == 200
+        check("microscopic speed exceedance -> 200", ok, r.text)
+        if ok:
+            body = r.json()
+            check("microscopic exceedance not approved", body["approved"] is False, r.text)
+            vs = body["violations"]
+            check(
+                "microscopic exceedance locates velocity constraint",
+                len(vs) == 1
+                and (vs[0]["segment"], vs[0]["joint"], vs[0]["constraint"])
+                == (1, 1, "velocity"),
+                json.dumps(vs),
+            )
+            raw = json.loads(r.text, parse_float=Decimal)
+            value = raw["violations"][0]["value"]
+            limit = raw["violations"][0]["limit"]
+            peak = raw["peaks"][0]["maxVelocity"]
+            check(
+                "violation value strictly above limit at full precision",
+                value > limit and value == Decimal(B),
+                f"{value} vs {limit}",
+            )
+            check(
+                "peak rendered strictly above the smaller limit",
+                peak > Decimal(1) and peak == Decimal(B),
+                str(peak),
+            )
+            check("wire literal keeps the 60th-digit excess", B in r.text)
+
+        # 8. Two position-continuous segments whose endpoint speeds differ only
+        #    at the 60th decimal: exact continuity requires 422.
+        micro_discontinuous = {
+            "joints": [
+                {"lower": "-2", "upper": "2", "maxVelocity": "10", "maxAcceleration": "10"}
+            ],
+            "segments": [
+                {"duration": "1", "controlPoints": [["-1", "-1", "-1", "0"]]},
+                {"duration": "1", "controlPoints": [["0", B, B, B]]},
+            ],
+        }
+        r = post(client, micro_discontinuous)
+        check("microscopic velocity discontinuity -> 422", r.status_code == 422, r.text)
+        if r.status_code == 422:
+            match = [
+                e
+                for e in r.json()["detail"]
+                if e.get("type") == "continuity.velocity"
+                and tuple(e["loc"])
+                == ("body", "segments", 1, "controlPoints", 0)
+            ]
+            check(
+                "velocity discontinuity located at next segment first control point",
+                bool(match),
+                json.dumps(r.json()["detail"]),
+            )
+
+        # 9. Macroscopic boundary discontinuities (position and velocity) are
+        #    still rejected with locatable field paths.
+        pos_gap = {
+            "joints": [
+                {"lower": 0, "upper": 10, "maxVelocity": "10", "maxAcceleration": "10"}
+            ],
+            "segments": [
+                {"duration": 1, "controlPoints": [[0, 0, 1, 1]]},
+                {"duration": 1, "controlPoints": [[1.5, 1.5, 2, 2]]},
+            ],
+        }
+        r = post(client, pos_gap)
+        check("position discontinuity -> 422", r.status_code == 422)
+        if r.status_code == 422:
+            check(
+                "position discontinuity located",
+                ("body", "segments", 1, "controlPoints", 0, 0)
+                in [tuple(e["loc"]) for e in r.json()["detail"]],
+            )
 
     print()
     if failures:
