@@ -1,0 +1,33 @@
+services:
+  api:
+    build: .
+    image: trajectory-audit-api
+    environment:
+      PORT: "${PORT:-8000}"
+      HEALTH_PATH: "${HEALTH_PATH:-/health}"
+    ports:
+      # Host-side port is configurable via HOST_PORT.
+      - "${HOST_PORT:-8000}:${PORT:-8000}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,urllib.request; u='http://127.0.0.1:'+os.environ['PORT']+os.environ['HEALTH_PATH']; sys.exit(0 if urllib.request.urlopen(u, timeout=2).status == 200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: trajectory-audit-api
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: "http://api:${PORT:-8000}"
+      HEALTH_PATH: "${HEALTH_PATH:-/health}"
+    entrypoint: ["sh", "scripts/verify.sh"]
+    restart: "no"
